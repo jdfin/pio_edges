@@ -1,0 +1,173 @@
+.pio_version 0
+
+; This uses one PIO state machine to poll for change on a GPIO line and put a
+; tick count of when the GPIO changed into the RX FIFO.
+;
+; There is nothing that says whether it's a rising or falling edge. I'm not
+; sure how that information would be passed up through the FIFO; maybe use the
+; MSB of the tick or something. The timing was tricky to get right as it is.
+;
+; The tick count is kept by carefully scheduling decrements to the PIO's X
+; register in the polling loop. It decrements (exactly) every four PIO clocks,
+; for all code paths, so should be crystal-accurate. The only error introduced
+; is by where in the polling loop the GPIO really changed, i.e. there are four
+; PIO clocks in the loop, and a GPIO edge on any of those four clocks results
+; in the same tick count. If that's a problem, increase the PIO clock rate.
+;
+; The tick count is a 32-bit down counter. The PIO doesn't have an increment
+; instruction, and it's easy enough to convert after reading the timestamp.
+;
+; The tick resolution is set by changing the PIO clock rate (the "tick_hz"
+; parameter to edges_program_init()). For 1 usec resolution, use 1'000'000 for
+; tick_hz, or for 0.1 usec resolution, use 10'000'000. I've only tried those
+; two values, but anything that evenly divides into sys_clk (200 MHz on my
+; Pico) / 4 (PIO clocks per tick) should work fine. I don't know what errors
+; (if any) using the fractional part of the clock divider would introduce. It
+; would likely be fine.
+;
+; The CPU code can either poll for the PIO RX FIFO to have data, or trigger an
+; interrupt on RX FIFO not empty and read the tick there.
+;
+; To change this code, you need to know how the PIO works and be ready to
+; count clock cycles.
+
+.program edges
+
+.wrap_target
+
+; poll for falling edge
+L0: nop [1]
+L1: jmp  x-- L2
+L2: jmp  pin L0
+
+; falling edge detected
+L3: mov  isr x [1]
+L4: jmp  x-- L5
+L5: push noblock [2]
+
+; poll for rising edge
+L6: jmp  x-- L7
+L7: jmp  pin L9 [1]
+L8: jmp  L6
+
+; rising edge detected
+L9: mov  isr x
+LA: jmp  x-- LB
+LB: push noblock
+
+.wrap
+
+; Falling edge, rising edge, falling edge. Things to note:
+;
+; * The X register always decrements every four cycles. The resolution of the
+;   timestamps will be pio_clk / 4, e.g. if pio_clk is 4 MHz, timestamps have
+;   1 usec resolution; if pio_clk is 40 HMz, a 0.1 usec resolution.
+;
+; * A timestamp is available 5 pio_clks after the edge is detected, either
+;   rising or falling. This is not very important, but is nice that they are
+;   the same.
+;
+; * The time from a falling edge to the next rising edge, and vice versa, is a
+;   multiple of four PIO clocks. This means neither edge will be artificially
+;   delayed a clock or two compared to the other.
+;
+; * These properties might not hold if a high or low pulse is only a clock or
+;   two long. If you need to measure very short pulses like that, increase
+;   pio_clk.
+;
+; +-----+----+-----------+-----+-----+------+
+; | PIN | PC | INSTR     |  X  | ISR | FIFO |
+; +-----+----+-----------+-----+-----+------+
+; |  1  |  2 | jmp pin 0 | 15  |     |      |
+; |     |  0 | nop       | 15  |     |      |
+; |     |    |           | 15  |     |      |
+; |     |  1 | jmp x-- 2 | 15  |     |      |
+; |  1  |  2 | jmp pin 0 | 14  |     |      |
+; |     |  0 | nop       | 14  |     |      |
+; |     |    |           | 14  |     |      |
+; |     |  1 | jmp x-- 2 | 14  |     |      |
+; |  0  |  2 | jmp pin 0 | 13  |     |      | < 0 falling edge detected
+; |     |  3 | mov isr x | 13  |     |      |
+; |     |    |           | 13  | 13  |      |
+; |     |  4 | jmp x-- 5 | 13  | 13  |      |
+; |     |  5 | push      | 12  | 13  |      |
+; |     |    |           | 12  |     |  13  | < +5 timestamp available
+; |     |    |           | 12  |     |      |
+; |     |  6 | jmp x-- 7 | 12  |     |      |
+; |  0  |  7 | jmp pin 9 | 11  |     |      |
+; |     |    |           | 11  |     |      |
+; |     |  8 | jmp 6     | 11  |     |      |
+; |     |  6 | jmp x-- 7 | 11  |     |      |
+; |  0  |  7 | jmp pin 9 | 10  |     |      |
+; |     |    |           | 10  |     |      |
+; |     |  8 | jmp 6     | 10  |     |      |
+; |     |  6 | jmp x-- 7 | 10  |     |      |
+; |  1  |  7 | jmp pin 9 |  9  |     |      | < +16 rising edge detected
+; |     |    |           |  9  |     |      |
+; |     |  9 | mov isr x |  9  |     |      |
+; |     |  A | jmp x-- B |  9  |  9  |      |
+; |     |  B | push      |  8  |  9  |      |
+; |     |  0 | nop       |  8  |     |   9  | < +21 timestamp available
+; |     |    |           |  8  |     |      |
+; |     |  1 | jmp x-- 2 |  8  |     |      |
+; |  1  |  2 | jmp pin 0 |  7  |     |      |
+; |     |  0 | nop       |  7  |     |      |
+; |     |    |           |  7  |     |      |
+; |     |  1 | jmp x-- 2 |  7  |     |      |
+; |  1  |  2 | jmp pin 0 |  6  |     |      |
+; |     |  0 | nop       |  6  |     |      |
+; |     |    |           |  6  |     |      |
+; |     |  1 | jmp x-- 2 |  6  |     |      |
+; |  0  |  2 | jmp pin 0 |  5  |     |      | < +32 falling edge detected
+; |     |  3 | mov isr x |  5  |     |      |
+; |     |    |           |  5  |  5  |      |
+; |     |  4 | jmp x-- 5 |  5  |  5  |      |
+; |     |  5 | push      |  4  |  5  |      |
+; |     |    |           |  4  |     |   5  | < +37 timestamp available
+; |     |    |           |  4  |     |      |
+; |     |  6 | jmp x-- 7 |  4  |     |      |
+; |  0  |  7 | jmp pin 9 |  3  |     |      |
+; |     |    |           |  3  |     |      |
+; |     |  8 | jmp 6     |  3  |     |      |
+; |     |  6 | jmp x-- 7 |  3  |     |      |
+; |  0  |  7 | jmp pin 9 |  2  |     |      |
+; |     |    |           |  2  |     |      |
+; |     |  8 | jmp 6     |  2  |     |      |
+; |     |  6 | jmp x-- 7 |  2  |     |      |
+; +-----+----+-----------+-----+-----+------+
+
+% c-sdk {
+
+// x-register in pio code decrements every this-many clocks (pio code above)
+static const uint32_t edges_div = 4;
+
+static inline void edges_program_init(PIO pio, uint sm, uint offset, uint pin, uint tick_hz)
+{
+    pio_sm_set_consecutive_pindirs(pio, sm, pin, 1, false);
+
+    pio_gpio_init(pio, pin);
+
+    pio_sm_config c = edges_program_get_default_config(offset);
+
+    sm_config_set_jmp_pin(&c, pin);
+
+    // clock frequency to pio
+    const uint32_t pio_clk_hz = clock_get_hz(clk_sys);
+
+    const uint32_t clk_div = pio_clk_hz / edges_div / tick_hz;
+
+    // for pio_clk_hz = 200 MHz, edges_div = 4,
+    //   and tick_hz =  1,000,000, clk_div is 50
+    //   and tick_hz = 10,000,000, clk_div is 5
+
+    sm_config_set_clkdiv_int_frac8(&c, clk_div, 0);
+
+    // this makes fifo 8-deep
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset, &c);
+
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}
