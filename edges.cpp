@@ -13,6 +13,8 @@
 PIO Edges::_pio = NULL; // pointer to the hardware registers
 uint Edges::_sm = UINT_MAX;
 queue_t Edges::_queue;
+int Edges::_sync = 0;
+int Edges::_rise = 0;
 
 
 void Edges::setup(int gpio, uint tick_hz)
@@ -31,6 +33,44 @@ void Edges::setup(int gpio, uint tick_hz)
 }
 
 
+// sync=0: waiting for something not a zero or one
+//      0/1:    stay in sync=0
+//      other:  go to sync=1
+// sync=1: waiting for rise/fall (must be zero or one)
+//      0/1:    note rise/fall, go to sync=2
+//      other:  stay in sync=1
+// sync=2: waiting for timestamp (might be zero or one)
+//      any:    return timestamp and rise/fall, go to sync=1
+bool Edges::get_tick(int& rise, uint32_t& tick)
+{
+    int32_t data;
+    if (!queue_try_remove(&_queue, &data))
+        return false;
+
+    if (_sync == 0) {
+        if (data != 0 && data != 1)
+            _sync = 1;
+        return false;
+
+    } else if (_sync == 1) {
+        if (data == 0 || data == 1) {
+            _rise = data;
+            _sync = 2;
+        }
+        return false;
+
+    } else {
+        xassert(_sync == 2);
+        rise = _rise;
+        // change from down counter to up counter
+        tick = uint32_t(-data);
+        _sync = 1;
+        return true;
+
+    }
+}
+
+
 uint32_t Edges::div()
 {
     return edges_div;
@@ -39,10 +79,10 @@ uint32_t Edges::div()
 
 void Edges::pio_irq_handler()
 {
-    // read available ticks and put them in the queue
+    // read available data and put them in the queue
     while (!pio_sm_is_rx_fifo_empty(_pio, _sm)) {
-        uint32_t tick = pio_sm_get_blocking(_pio, _sm);
-        (void)queue_try_add(&_queue, &tick);
+        uint32_t data = pio_sm_get_blocking(_pio, _sm);
+        (void)queue_try_add(&_queue, &data);
     }
 }
 
