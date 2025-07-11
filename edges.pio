@@ -1,11 +1,9 @@
 .pio_version 0
 
 ; This uses one PIO state machine to poll for change on a GPIO line and put a
-; tick count of when the GPIO changed into the RX FIFO.
-;
-; There is nothing that says whether it's a rising or falling edge. I'm not
-; sure how that information would be passed up through the FIFO; maybe use the
-; MSB of the tick or something. The timing was tricky to get right as it is.
+; tick count of when the GPIO changed into the RX FIFO. Before the tick count
+; is written to the FIFO, a '0' is written if it's a falling edge, or a '1' is
+; written if it's a rising edge.
 ;
 ; The tick count is kept by carefully scheduling decrements to the PIO's X
 ; register in the polling loop. It decrements (exactly) every four PIO clocks,
